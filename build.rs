@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let outdir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+
     let build_dir = outdir.join("build");
     let _ = fs::remove_dir_all(&build_dir);
     fs::create_dir(&build_dir).unwrap();
@@ -37,5 +38,11 @@ fn main() {
         }
     }
 
+     cc::Build::new()
+        .file("erasurecode_wrapper.c")
+        .compile("erasurecode_wrapper");
+
+
     println!("cargo:rustc-link-search={}/lib", build_dir.display());
+    println!("cargo:rustc-link-lib=z");
 }

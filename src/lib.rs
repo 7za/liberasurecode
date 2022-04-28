@@ -50,6 +50,7 @@ use std::num::NonZeroUsize;
 use std::slice;
 use std::time::Duration;
 
+
 pub use crate::result::{Error, Result};
 
 mod c_api;
@@ -63,11 +64,17 @@ pub enum Backend {
 
     /// Cauchy base Read-Solomon erasure coding provided by `jerasure` library (default).
     JerasureRsCauchy,
+
+   /// ISA-L base providedd by libisal library
+   IsalRsVand,
+
+    /// ISA-L RS CAUCHY variant
+    IsalRsCauchy,
 }
 impl Default for Backend {
     /// `Backend::JerasureRsCauchy`を返す.
     fn default() -> Self {
-        Backend::JerasureRsCauchy
+        Backend::IsalRsCauchy
     }
 }
 
@@ -82,6 +89,9 @@ pub enum Checksum {
 
     /// MD5.
     Md5,
+
+    /// XxHash
+    XxHash,
 }
 impl Default for Checksum {
     /// `Checksum::None`を返す.
@@ -102,10 +112,10 @@ pub struct Builder {
 }
 impl Builder {
     /// The default backend.
-    pub const DEFAULT_BACKEND: Backend = Backend::JerasureRsCauchy;
+    pub const DEFAULT_BACKEND: Backend = Backend::IsalRsCauchy;
 
     /// The default checksum algorithm.
-    pub const DEFAULT_CHECKSUM: Checksum = Checksum::None;
+    pub const DEFAULT_CHECKSUM: Checksum = Checksum::XxHash;
 
     /// Makes a new `Builder` with the default settings.
     ///
@@ -143,11 +153,14 @@ impl Builder {
         let backend_id = match self.backend {
             Backend::JerasureRsCauchy => c_api::EcBackendId::JERASURE_RS_CAUCHY,
             Backend::JerasureRsVand => c_api::EcBackendId::JERASURE_RS_VAND,
+            Backend::IsalRsVand => c_api::EcBackendId::ISA_L_RS_VAND,
+            Backend::IsalRsCauchy => c_api::EcBackendId::ISA_L_RS_CAUCHY,
         };
         let checksum_type = match self.checksum {
             Checksum::None => c_api::EcChecksumType::NONE,
             Checksum::Crc32 => c_api::EcChecksumType::CRC32,
             Checksum::Md5 => c_api::EcChecksumType::MD5,
+            Checksum::XxHash => c_api::EcChecksumType::XXHASH,
         };
         let ec_args = c_api::EcArgs {
             k: self.data_fragments.get() as libc::c_int,
@@ -210,6 +223,196 @@ pub struct ErasureCoder {
     parity_fragments: NonZeroUsize,
     desc: c_api::Desc,
 }
+
+/// `ErasureChunkContext` stores all computation of by chunk erasure coding
+pub struct ErasureChunkContext  {
+    data:  Vec<*mut u8>,
+    codings: Vec<*mut u8>,
+    nr_subgroups: usize,
+    chunk_size: usize,
+    frag_len: usize,
+    data_len: usize,
+    k: usize,
+    n: usize,
+    desc: Desc,
+}
+
+#[repr(C, packed)]
+#[derive(Debug)]
+struct FragmentHeaderMetadata {
+    idx: u32,
+    size: u32,
+    frag_backend_metadata_size: u32,
+    orig_data_size: u64,
+    cksum_type: u8,
+    cksum: [u32; 8],
+    cksum_mismatch: u8,
+    backend_id: u8,
+    backend_vesion: u32,
+}
+
+static  LIBERASURECODE_FRAG_HEADER_MAGIC: u32 = 0xb0c5ecc;
+
+#[repr(C, packed)]
+#[derive(Debug)]
+struct FragmentHeader {
+    meta : FragmentHeaderMetadata,
+    magic: u32,
+    libec_version: u32,
+    metadata_cksum: u32,
+    aligned_padding: [u8; 9],
+}
+
+use std::alloc::{alloc, dealloc, Layout};
+use std::sync::{Mutex};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use crate::c_api::{Desc, encode_chunk};
+
+
+unsafe impl Send for ErasureChunkContext {}
+unsafe impl Sync for ErasureChunkContext {}
+
+impl Drop for ErasureChunkContext {
+
+    fn drop(&mut self) {
+        unsafe {
+            let l = Layout::from_size_align(self.frag_len, 16).unwrap();
+            for p in &self.data {
+                dealloc(*p, l);
+            }
+        }
+    }
+}
+
+impl ErasureChunkContext {
+    pub fn new(desc: Desc, data_len: usize, k: usize, n: usize, chunk_size: usize) -> Self {
+        let block_size = chunk_size * k;
+        let mut nr_sub_groups = data_len / block_size;
+        if nr_sub_groups * block_size != data_len {
+            nr_sub_groups += 1;
+        }
+
+        let fragment_len = (std::mem::size_of::<FragmentHeader>() +
+            chunk_size) * nr_sub_groups;
+
+        ErasureChunkContext {
+            desc,
+            data: (0..k)
+                .map(|_|
+                    unsafe {
+                        let r = alloc(Layout::from_size_align(fragment_len, 16).unwrap());
+                        r
+                    })
+                .collect(),
+            codings: (0..n)
+                .map(|_|
+                    unsafe {
+                        let p = alloc(Layout::from_size_align(fragment_len, 16).unwrap());
+                        println!("in function prepare alloc coding={:p} with len={}", p, fragment_len);
+                        p
+                    })
+                .collect(),
+            nr_subgroups: nr_sub_groups,
+            chunk_size,
+            frag_len: fragment_len,
+            data_len,
+            k,
+            n,
+        }
+    }
+
+    pub fn encode_matrix(&mut self, data: &[u8]) {
+        let nr_sub_group = self.nr_subgroups;
+        (0..nr_sub_group)
+            .into_par_iter()
+            .for_each(| i|
+                {
+                    self.do_chunk(data,  i);
+                }
+            );
+    }
+
+    /// Compute a sub chunk coding thru `ErasureChunkContext`
+    fn do_chunk(& self, data: &[u8], nth: usize) {
+        let mut vec_data: Vec<*mut u8> = Vec::new();
+        let mut vec_coding: Vec<*mut u8> = Vec::new();
+        assert!(nth < self.nr_subgroups);
+
+        let mut tot_len = 0;
+
+        let mut off_start = self.k * nth * self.chunk_size;
+
+        let one_cell_size = std::mem::size_of::<FragmentHeader>() + self.chunk_size;
+
+        for i in 0..self.k {
+            let ptr = self.data.get(i).unwrap();
+            let off_end = {
+                let mut  ret = off_start + self.chunk_size;
+                if off_start + self.chunk_size > data.len() {
+                    ret = data.len()
+                }
+                ret
+            };
+            let data_offset = &data[off_start..off_end];
+
+
+            let (_start_hdr, start_data) =
+                unsafe {
+                    let wh = ptr.add(nth * one_cell_size);
+                    let p = &mut *(wh as *mut FragmentHeader);
+                    (p).magic = LIBERASURECODE_FRAG_HEADER_MAGIC;
+                    (p, wh.add(std::mem::size_of::<FragmentHeader>()))
+                };
+            let to_copy = off_end - off_start;
+            unsafe {
+                std::ptr::copy(data_offset.as_ptr(),start_data, to_copy);
+            }
+            tot_len += to_copy;
+            vec_data.push(start_data);
+            off_start += self.chunk_size;
+        }
+        for i in 0..self.n {
+            let ptr = self.codings.get(i).unwrap();
+            let (_start_hdr, start_data) =
+                unsafe {
+                    let wh = ptr.add(nth * one_cell_size);
+                    let p = &mut *(wh as *mut FragmentHeader);
+                    p.magic = LIBERASURECODE_FRAG_HEADER_MAGIC;
+                    (p, wh.add(std::mem::size_of::<FragmentHeader>()))
+                };
+            println!("register subchunk coding {:p}", start_data);
+            vec_coding.push(start_data);
+        }
+        encode_chunk(self.desc,vec_data.as_slice(),
+                     vec_coding.as_slice(), self.chunk_size,
+                     tot_len, self.k, self.n);
+    }
+
+    pub fn rawmap(&self) {
+        for w in 0..self.nr_subgroups {
+            for i in 0..self.k {
+                let mut ptr = *self.data.get(i).unwrap();
+                let f = unsafe {
+                    ptr = ptr.add(w * (self.chunk_size + std::mem::size_of::<FragmentHeader>()));
+                    &*(ptr as *mut FragmentHeader)
+                };
+                println!("subchunk={} data{} : {:#?}", w, i, f);
+            }
+
+            for i in 0..self.n {
+                let mut ptr = *self.codings.get(i).unwrap();
+                let f = unsafe {
+                    ptr = ptr.add(w * (self.chunk_size + std::mem::size_of::<FragmentHeader>()));
+                    &*(ptr as *mut FragmentHeader)
+                };
+                println!("subchunk={} coding{} : {:#?}", w, i, f);
+            }
+        }
+    }
+
+}
+
+
 impl ErasureCoder {
     /// Makes a new `ErasureCoder` instance with the default settings.
     ///
@@ -259,6 +462,7 @@ impl ErasureCoder {
         Ok(fragments)
     }
 
+
     /// Decodes the original data from the given fragments.
     pub fn decode<T: AsRef<[u8]>>(&mut self, fragments: &[T]) -> Result<Vec<u8>> {
         if fragments.is_empty() {
@@ -304,7 +508,7 @@ fn with_global_lock<F, T>(f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    use std::sync::{Mutex, Once};
+    use std::sync::{Once};
 
     static mut MUTEX: Option<Mutex<()>> = None;
     static INIT: Once = Once::new();
@@ -419,6 +623,24 @@ mod tests {
             coder.reconstruct(9, encoded.iter()),
             Err(Error::InvalidParams)
         );
+    }
+
+    #[test]
+    fn chunk_matrix() {
+        let coder = ErasureCoder::new(non_zero(4), non_zero(1)).unwrap();
+        //let data = vec![5; 262144];
+        let data = (0..262144).map(|val : u32|
+                                                            {
+                                                                let p : u8 = 'a' as u8 + ((val % 24) as u8);
+                                                                p
+                                                            })
+                                        .collect::<Vec<u8>>();
+        //coder.do_chunk(data.as_slice(), &mut encoded, 0);
+        //coder.encode_matrix(data.as_slice(), 32768);
+        let mut encoded = ErasureChunkContext::new(coder.desc, data.len(),4, 1,32768);
+
+        encoded.encode_matrix(data.as_slice());
+        encoded.rawmap();
     }
 
     #[test]

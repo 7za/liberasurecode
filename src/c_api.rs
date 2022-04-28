@@ -11,6 +11,7 @@ pub enum EcBackendId {
     ISA_L_RS_VAND = 4,
     SHSS = 5,
     LIBERASURECODE_RS_VAND = 6,
+    ISA_L_RS_CAUCHY = 7,
 }
 
 #[repr(C)]
@@ -18,6 +19,7 @@ pub enum EcChecksumType {
     NONE = 1,
     CRC32 = 2,
     MD5 = 3,
+    XXHASH = 4,
 }
 
 #[repr(C)]
@@ -47,6 +49,7 @@ pub const EINSUFFFRAGS: u32 = 208;
 #[link(name = "gf_complete", kind = "static")]
 #[link(name = "Jerasure", kind = "static")]
 #[link(name = "Xorcode", kind = "static")]
+#[link(name = "isal")]
 extern "C" {
     /// Create a liberasurecode instance and return a descriptor
     /// for use with EC operations (encode, decode, reconstruct)
@@ -98,6 +101,16 @@ extern "C" {
         encoded_data: *mut *mut *mut u8,
         encoded_parity: *mut *mut *mut u8,
         fragment_len: *mut u64,
+    ) -> c_int;
+
+    fn encode_internal(
+        desc: Desc,
+        ptr_datas: *const *mut u8,
+        ptr_codings: *const *mut u8,
+        chunk_size: usize,
+        tot_len: usize,
+        k: usize,
+        m: usize,
     ) -> c_int;
 
     /// Cleanup structures allocated by librasurecode_encode
@@ -228,6 +241,26 @@ pub fn encode_cleanup(
     match unsafe { liberasurecode_encode_cleanup(desc, encoded_data, encoded_parity) } {
         0 => Ok(()),
         code => Err(-code as ErrorCode),
+    }
+}
+
+pub fn encode_chunk(
+    desc: Desc,
+    data: &[*mut u8],
+    coding: &[*mut u8],
+    chunk_size: usize,
+    tot_len: usize,
+    k: usize,
+    m: usize) {
+
+    let result = unsafe {
+        let array_data = data.as_ptr();
+        let array_coding = coding.as_ptr();
+        encode_internal(desc, array_data, array_coding, chunk_size, tot_len, k, m)
+    };
+    match result {
+        0 => { },
+        _ => println!("err"),
     }
 }
 
