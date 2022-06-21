@@ -43,12 +43,12 @@
 //! # Ok(())
 //! # }
 //! ```
-#![warn(missing_docs)]
 extern crate libc;
 
 use std::num::NonZeroUsize;
 use std::slice;
 use std::time::Duration;
+
 
 pub use crate::result::{Error, Result};
 
@@ -63,11 +63,17 @@ pub enum Backend {
 
     /// Cauchy base Read-Solomon erasure coding provided by `jerasure` library (default).
     JerasureRsCauchy,
+
+   /// ISA-L base providedd by libisal library
+   IsalRsVand,
+
+    /// ISA-L RS CAUCHY variant
+    IsalRsCauchy,
 }
 impl Default for Backend {
     /// `Backend::JerasureRsCauchy`を返す.
     fn default() -> Self {
-        Backend::JerasureRsCauchy
+        Backend::IsalRsCauchy
     }
 }
 
@@ -82,6 +88,9 @@ pub enum Checksum {
 
     /// MD5.
     Md5,
+
+    /// XxHash
+    XxHash,
 }
 impl Default for Checksum {
     /// `Checksum::None`を返す.
@@ -102,10 +111,10 @@ pub struct Builder {
 }
 impl Builder {
     /// The default backend.
-    pub const DEFAULT_BACKEND: Backend = Backend::JerasureRsCauchy;
+    pub const DEFAULT_BACKEND: Backend = Backend::IsalRsCauchy;
 
     /// The default checksum algorithm.
-    pub const DEFAULT_CHECKSUM: Checksum = Checksum::None;
+    pub const DEFAULT_CHECKSUM: Checksum = Checksum::XxHash;
 
     /// Makes a new `Builder` with the default settings.
     ///
@@ -143,11 +152,14 @@ impl Builder {
         let backend_id = match self.backend {
             Backend::JerasureRsCauchy => c_api::EcBackendId::JERASURE_RS_CAUCHY,
             Backend::JerasureRsVand => c_api::EcBackendId::JERASURE_RS_VAND,
+            Backend::IsalRsVand => c_api::EcBackendId::ISA_L_RS_VAND,
+            Backend::IsalRsCauchy => c_api::EcBackendId::ISA_L_RS_CAUCHY,
         };
         let checksum_type = match self.checksum {
             Checksum::None => c_api::EcChecksumType::NONE,
             Checksum::Crc32 => c_api::EcChecksumType::CRC32,
             Checksum::Md5 => c_api::EcChecksumType::MD5,
+            Checksum::XxHash => c_api::EcChecksumType::XXHASH,
         };
         let ec_args = c_api::EcArgs {
             k: self.data_fragments.get() as libc::c_int,
@@ -210,12 +222,70 @@ pub struct ErasureCoder {
     parity_fragments: NonZeroUsize,
     desc: c_api::Desc,
 }
+
+#[repr(C, packed)]
+pub struct FragmentHeaderMetadata {
+    idx: u32,
+    size: u32,
+    frag_backend_metadata_size: u32,
+    orig_data_size: u64,
+    cksum_type: u8,
+    cksum: [u32; 8],
+    cksum_mismatch: u8,
+    backend_id: u8,
+    backend_vesion: u32,
+}
+
+static LIBERASURECODE_FRAG_HEADER_MAGIC: u32 = 0xb0c5ecc;
+
+#[repr(C, packed)]
+pub struct FragmentHeader {
+    meta : FragmentHeaderMetadata,
+    magic: u32,
+    libec_version: u32,
+    metadata_cksum: u32,
+    aligned_padding: [u8; 9],
+}
+
+impl FragmentHeader {
+    pub fn init(ptr: *mut u8) {
+        let mut p =  ptr as *mut FragmentHeader;
+        unsafe {
+            (*p).magic = LIBERASURECODE_FRAG_HEADER_MAGIC;
+        }
+    }
+}
+
+use std::sync::{Mutex};
+use crate::c_api::{encode_chunk};
+
+
 impl ErasureCoder {
     /// Makes a new `ErasureCoder` instance with the default settings.
     ///
     /// This is equivalent to `Builder::new(data_fragments, parity_fragments).finish()`.
     pub fn new(data_fragments: NonZeroUsize, parity_fragments: NonZeroUsize) -> Result<Self> {
         Builder::new(data_fragments, parity_fragments).finish()
+    }
+
+    pub fn encode_chunk(&self, data: &[*mut u8], coding: &[*mut u8],
+                        chunk_size: usize, tot_len: usize) {
+        for data_ptr in data {
+            unsafe {
+                let d = (*data_ptr).sub(std::mem::size_of::<FragmentHeader>());
+                let m =  d as *mut FragmentHeader;
+                (*m).magic = LIBERASURECODE_FRAG_HEADER_MAGIC;
+            }
+        }
+        for coding_ptr in coding {
+            unsafe {
+                let d = (*coding_ptr).sub(std::mem::size_of::<FragmentHeader>());
+                let m =  d as *mut FragmentHeader;
+                (*m).magic = LIBERASURECODE_FRAG_HEADER_MAGIC;
+            }
+        }
+        encode_chunk(self.desc, data, coding,
+                     chunk_size, tot_len, self.data_fragments.get(), self.parity_fragments.get());
     }
 
     /// Returns the number of data fragments specified to the coder.
@@ -258,6 +328,7 @@ impl ErasureCoder {
             .map_err(Error::from_error_code)?;
         Ok(fragments)
     }
+
 
     /// Decodes the original data from the given fragments.
     pub fn decode<T: AsRef<[u8]>>(&mut self, fragments: &[T]) -> Result<Vec<u8>> {
@@ -304,7 +375,7 @@ fn with_global_lock<F, T>(f: F) -> T
 where
     F: FnOnce() -> T,
 {
-    use std::sync::{Mutex, Once};
+    use std::sync::{Once};
 
     static mut MUTEX: Option<Mutex<()>> = None;
     static INIT: Once = Once::new();

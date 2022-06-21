@@ -1,6 +1,6 @@
 #! /usr/bin/env bash
 
-set -eux
+set -veux
 
 BUILD_DIR=$PWD
 MAKE_FLAGS=""
@@ -13,6 +13,8 @@ case "$(uname)" in
     "Darwin") MAKE_FLAGS="-j$(sysctl -n hw.ncpu)"
 esac
 
+export CFLAGS="-O2"
+
 #
 # gf-complete
 #
@@ -21,9 +23,9 @@ cd gf-complete/
 git checkout a6862d1
 ./autogen.sh
 if [[ $DEBUG = true ]]; then
-    ./configure --disable-shared --with-pic --prefix $BUILD_DIR CFLAGS="${CFLAGS:-} -O0 -g"
+    ./configure --disable-shared --with-pic --prefix $BUILD_DIR CFLAGS="${CFLAGS:-}"
 else
-    ./configure --disable-shared --with-pic --prefix $BUILD_DIR
+    ./configure --disable-shared --with-pic --prefix $BUILD_DIR CFLAGS="${CFLAGS:-}"
 fi
 make $MAKE_FLAGS install
 cd ../
@@ -36,7 +38,7 @@ cd jerasure/
 git checkout de1739c
 autoreconf --force --install
 if [[ $DEBUG = true ]]; then
-    ./configure --disable-shared --enable-static --with-pic --prefix $BUILD_DIR CFLAGS="${CFLAGS:-} -O0 -g"
+    ./configure --disable-shared --enable-static --with-pic --prefix $BUILD_DIR CFLAGS="${CFLAGS:-}"
 else
     ./configure --disable-shared --enable-static --with-pic --prefix $BUILD_DIR
 fi
@@ -46,19 +48,17 @@ cd ../
 #
 # liberasurecode
 #
-git clone https://github.com/openstack/liberasurecode.git
+git clone https://github.com/scality/liberasurecode
 cd liberasurecode/
-git checkout 1.5.0
-if [ "$(uname)" == "Darwin" ]; then
-    # if the compiler has the feature to check `address-of-packed-member`, we suppress it.
-    # it is only annoying for liberasurecode v1.5.0.
-    patch -p1 < ../for_darwin_to_detect_compiler_flag.patch
-fi
+echo $PWD
+git checkout development/1.0
+patch -p1 < ../for_darwin_to_detect_compiler_flag.patch
 ./autogen.sh
 if [[ $DEBUG = true ]]; then
-    LIBS="-lJerasure" ./configure --disable-shared --with-pic --prefix $BUILD_DIR CFLAGS="${CFLAGS:-} -O0 -g"
+    LIBS="-lJerasure" ./configure --disable-shared --with-pic --prefix $BUILD_DIR CFLAGS="${CFLAGS:-}"
 else
-    LIBS="-lJerasure" ./configure --disable-shared --with-pic --prefix $BUILD_DIR
+    LIBS="-lJerasure" ./configure --disable-shared --with-pic --prefix $BUILD_DIR CFLAGS="$CFLAGS"
 fi
-patch -p1 < ../liberasurecode.patch # Applies a patch for building static library
+#patch -p1 < ../liberasurecode.patch # Applies a patch for building static library
+#patch -p1 < ../liberasurecode.patch # Applies a patch for building static library
 make $MAKE_FLAGS install
